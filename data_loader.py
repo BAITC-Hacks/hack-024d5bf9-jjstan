@@ -12,6 +12,7 @@ from io import BytesIO
 from itertools import chain, islice
 from pathlib import Path
 import re
+from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile, ZipFile
 
 import numpy as np
@@ -29,7 +30,7 @@ SCHEMAS = {
     "stockouts": "supplier sku warehouse start_date end_date".split(),
     "quality_report": "supplier sku severity issue source".split(),
 }
-DATE_COLUMNS = {"month", "date", "as_of", "expected_date", "start_date", "end_date", "report_month"}
+DATE_COLUMNS = {"month", "date", "as_of", "expected_date", "start_date", "end_date", "report_month", "snapshot_as_of"}
 NUMBER_COLUMNS = {"quantity", "free_stock", "min_order_qty", "pack_multiple", "factor",
                   "raw_quantity", "stock_quantity", "growth_coefficient_raw", "seasonality_coefficient_raw"}
 MONTHS = {v: i for i, v in enumerate(
@@ -65,7 +66,13 @@ def _date(value):
     if isinstance(value, (datetime, date, pd.Timestamp)):
         return pd.Timestamp(value)
     if isinstance(value, str):
-        return pd.to_datetime(value.strip(), dayfirst=True, errors="coerce")
+        value = value.strip()
+        for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y", "%Y-%m-%d"):
+            try:
+                return pd.Timestamp(datetime.strptime(value, fmt))
+            except ValueError:
+                pass
+        return pd.to_datetime(value, dayfirst=True, errors="coerce")
     return pd.NaT  # Do not guess the epoch of an unformatted numeric cell.
 
 
@@ -103,6 +110,7 @@ class _Loader:
         self.seen = set()
         self.issues = set()
         self.cutoffs = {}
+        self.conflicts = defaultdict(set)
 
     def issue(self, supplier, sku, issue, source, severity="warning"):
         key = (supplier, sku, severity, issue, source)
@@ -134,26 +142,25 @@ class _Loader:
                 self.units[key].add(value)
             if field in p and p[field] != value and field != "name":
                 self.issue(supplier, sku, f"conflicting_product_{field}", source)
+                self.conflicts[key].add(field)
             else:
                 p[field] = value
 
     def ingest(self, name, payload):
         supplier, kind = _supplier(name), _kind(name)
-        digest = sha256(payload).hexdigest()
+        digest = (supplier, sha256(payload).hexdigest())
         if digest in self.seen:
             self.issue(supplier, None, "duplicate_file_skipped", name, "info")
             return
-        self.seen.add(digest)
         if supplier is None or kind is None:
             self.issue(supplier, None, "unrecognized_supplier_or_file_type", name, "error")
             return
+        self.seen.add(digest)
         self.suppliers.add(supplier)
-        cutoff = _file_date(name)
-        if kind == "snapshot" and pd.notna(cutoff):
-            self.cutoffs[supplier] = max(cutoff, self.cutoffs.get(supplier, cutoff))
+        cutoff = _file_date(Path(name).name)
         try:
             wb = load_workbook(BytesIO(payload), data_only=True, read_only=True)
-        except (BadZipFile, OSError, ValueError, KeyError) as exc:
+        except (BadZipFile, OSError, ValueError, KeyError, ParseError) as exc:
             self.issue(supplier, None, f"unreadable_workbook:{type(exc).__name__}", name, "error")
             return
         parsed = False
@@ -179,10 +186,13 @@ class _Loader:
             wb.close()
         if not parsed:
             self.issue(supplier, None, "required_header_not_found", name, "error")
+        elif kind == "snapshot" and pd.notna(cutoff):
+            self.cutoffs[supplier] = max(cutoff, self.cutoffs.get(supplier, cutoff))
 
     def seasonality(self, supplier, source, rows):
         columns = None
         parsed = False
+        seen_months = set()
         for row in rows:
             labels = [_label(c.value) for c in row]
             if "месяц" in labels and "сезонность" in labels:
@@ -193,6 +203,9 @@ class _Loader:
             a, b = columns
             month = MONTHS.get(labels[a][:3])
             if month:
+                if month in seen_months:
+                    break  # A second calculation block is not another supplier profile.
+                seen_months.add(month)
                 factor = self.number(row[b].value, supplier, None, source)
                 if pd.isna(factor) or factor <= 0:
                     self.issue(supplier, None, "invalid_seasonality_factor", source, "error")
@@ -200,6 +213,8 @@ class _Loader:
                 self.rows["seasonality"].append(dict(supplier=supplier, category=ALL,
                     month_number=month, factor=factor, source=source))
                 parsed = True
+                if len(seen_months) == 12:
+                    break
         if parsed:
             self.issue(supplier, None, "supplier_seasonality_includes_partial_2026_and_unconfirmed_measure", source)
         return parsed
@@ -213,6 +228,14 @@ class _Loader:
         article_col = idx("артикул поставщика", "артикул иэк", "артикул")
         month_latest = max(months.values()) if months else pd.NaT
         transit_cols = {i: h for i,h in enumerate(headers) if "поступление до" in h or "сэ в пути" in h}
+        if kind in {"monthly_sales", "history_stock"} and not months:
+            self.issue(supplier, None, "month_headers_missing", source, "error")
+        if kind == "transactions":
+            for field in ["дата", "номер", "документ", "количество"]:
+                if idx(field) is None:
+                    self.issue(supplier, None, f"transaction_header_missing:{field}", source, "error")
+        if kind == "snapshot" and not transit_cols:
+            self.issue(supplier, None, "transit_headers_missing", source, "error")
         if kind in {"monthly_sales", "history_stock", "snapshot"}:
             self.issue(supplier, None, "warehouse_scope_unconfirmed", source)
         if kind == "history_stock":
@@ -226,6 +249,8 @@ class _Loader:
                 return row[i].value if i is not None and i < len(row) else None
             sku = _text(val(code))
             name = _text(val(name_col))
+            if not sku and name and not _label(name).startswith("итого"):
+                self.issue(supplier, None, "sku_missing_for_named_row", source, "error")
             if not sku or _label(sku) in SKU_HEADERS or _label(sku).startswith("итого") or _label(name).startswith("итого"):
                 continue
             if isinstance(val(code), (int, float)):
@@ -243,6 +268,9 @@ class _Loader:
                     self.issue(supplier, sku, "nonpositive_order_constraint", source, "error")
                     n = np.nan
                 values[field] = n
+                values["order_constraint_raw"] = _text(val(col))
+                if col is None:
+                    self.issue(supplier, None, "order_constraint_header_missing", source, "error")
             if kind == "snapshot":
                 values.update(category=_text(val(idx("категория 2026"))))
                 for label, field in [("кэф. роста", "growth_coefficient_raw"), ("кэф. сез-ти", "seasonality_coefficient_raw")]:
@@ -269,6 +297,11 @@ class _Loader:
                     quantity, tx_type = np.nan, "unknown"
                     self.issue(supplier, sku, "unknown_document_type", source, "error")
                 when = _date(val(idx("дата")))
+                if pd.isna(raw):
+                    tx_type = "unknown"
+                    self.issue(supplier, sku, "transaction_quantity_missing", source, "error")
+                if quantity < 0 and label.startswith("расходная накладная"):
+                    self.issue(supplier, None, "negative_invoice_is_return_or_reversal_not_gross_sale", source, "info")
                 warehouse = _text(val(idx("склад")))
                 if pd.isna(when):
                     self.issue(supplier, sku, "invalid_transaction_date", source, "error")
@@ -298,6 +331,8 @@ class _Loader:
                     raw = self.number(val(col), supplier, sku, source)
                     if pd.isna(raw):
                         continue  # Blank is not a delivery or a zero; coverage warning below.
+                    if raw < 0:
+                        self.issue(supplier, sku, "negative_transit_quantity", source, "error")
                     match = re.search(r"поступление до\s*(\d{2}\.\d{2}\.\d{4})", h)
                     when = _date(match[1]) if match else pd.NaT
                     basis = "arrival_deadline" if match else "header_date_unconfirmed"
@@ -310,16 +345,21 @@ class _Loader:
                         self.issue(supplier, sku, "transit_date_missing", source, "error")
                     conversion = values.get("requires_unit_conversion", False)
                     self.rows["transit"].append(dict(base, warehouse=None, expected_date=when,
-                        quantity=np.nan if conversion else raw, raw_quantity=raw, unit=None,
-                        date_basis=basis, shipment=h, requires_unit_conversion=conversion))
+                        quantity=np.nan if conversion or raw < 0 else raw, raw_quantity=raw, unit=None,
+                        date_basis=basis, shipment=h, requires_unit_conversion=conversion, snapshot_as_of=cutoff))
 
     def finish(self):
         for key, p in self.products.items():
             supplier, sku = key
             units = self.units[key]
+            for field in self.conflicts[key]:
+                p[field] = np.nan if field in NUMBER_COLUMNS else None
             if len(units) != 1:
                 p["unit"] = None
                 self.issue(supplier, sku, "conflicting_units" if units else "unit_missing", "cross_source", "error")
+            elif next(iter(units)) not in {"шт", "шт.", "м", "м.", "упак", "упак.", "компл", "компл."}:
+                self.issue(supplier, sku, "unit_not_recognized", "cross_source", "error")
+                p["unit"] = None
             if len(self.product_sources[key]) == 1:
                 self.issue(supplier, sku, "sku_only_in_one_source_type", "cross_source")
             if p.get("requires_unit_conversion"):
@@ -330,6 +370,7 @@ class _Loader:
         for name, required in SCHEMAS.items():
             df = pd.DataFrame(self.rows[name])
             result[name] = df.reindex(columns=required + [c for c in df.columns if c not in required])
+        self.deduplicate(result)
         for supplier in sorted(self.suppliers):
             for missing in ["customer_id", "daily_stockouts", "supplier_lead_times", "bom"]:
                 self.issue(supplier, None, f"missing_{missing}", "provided_sources")
@@ -343,10 +384,31 @@ class _Loader:
                 if result[name].empty or not (result[name].supplier == supplier).any():
                     self.issue(supplier, None, f"missing_table_{name}", "provided_sources")
         # Resolve units only through exact supplier/SKU links; never convert quantities.
-        for name in ["stock", "transit"]:
+        for name in ["stock", "transit", "monthly_sales"]:
             df = result[name]
             if not df.empty:
                 df["unit"] = [self.products[(s, k)].get("unit") for s,k in zip(df.supplier,df.sku)]
+                df["unit_basis"] = "sku_reference"
+        for name in ["transactions", "monthly_sales", "stock", "transit"]:
+            df = result[name]
+            if df.empty:
+                continue
+            conflict = pd.Series([(s,k) in self.conflicts and "unit" in self.conflicts[(s,k)]
+                                  for s,k in zip(df.supplier,df.sku)], index=df.index)
+            quantity_col = "free_stock" if name == "stock" else "quantity"
+            if conflict.any():
+                if "raw_quantity" not in df:
+                    df["raw_quantity"] = df[quantity_col]
+                df.loc[conflict, quantity_col] = np.nan
+        stock = result["stock"]
+        current = stock.loc[stock.is_current.fillna(False) & stock.free_stock.notna(), ["supplier", "sku"]]
+        current_keys = set(current.itertuples(index=False, name=None))
+        monthly_keys = set(zip(result["monthly_sales"].supplier, result["monthly_sales"].sku))
+        for key in self.products:
+            if key not in current_keys:
+                self.issue(*key, "sku_current_free_stock_missing", "cross_source")
+            if "snapshot" in self.product_sources[key] and key not in monthly_keys:
+                self.issue(*key, "snapshot_sku_missing_monthly_history", "cross_source")
         monthly = result["monthly_sales"]
         for supplier, cutoff in self.cutoffs.items():
             mask = monthly.supplier == supplier
@@ -368,22 +430,75 @@ class _Loader:
                     df[col] = df[col].astype("string")
         return result
 
+    def deduplicate(self, result):
+        """Keep repeated identical facts once; quarantine conflicting keyed facts.
+
+        Transaction line IDs are unavailable: equal lines within one source are
+        retained. Repeated documents across sources cannot be safely concatenated.
+        """
+        stock = result["stock"]
+        for supplier, cutoff in self.cutoffs.items():
+            if not stock.empty:
+                old = (stock.supplier == supplier) & stock.is_current.fillna(False) & (stock.as_of < cutoff)
+                if old.any():
+                    stock.loc[old, "is_current"] = False
+                    self.issue(supplier, None, "older_stock_snapshots_marked_historical", "cross_source", "info")
+            transit = result["transit"]
+            if not transit.empty:
+                old = (transit.supplier == supplier) & transit.snapshot_as_of.notna() & (transit.snapshot_as_of < cutoff)
+                if old.any():
+                    result["transit"] = transit.loc[~old].reset_index(drop=True)
+                    self.issue(supplier, None, "older_transit_snapshots_excluded", "cross_source", "info")
+        specs = {
+            "monthly_sales": (["supplier", "sku", "month"], "quantity"),
+            "stock": (["supplier", "sku", "warehouse", "as_of", "report_month", "stock_basis"], "free_stock"),
+            "transit": (["supplier", "sku", "warehouse", "expected_date", "shipment"], "quantity"),
+            "seasonality": (["supplier", "category", "month_number"], "factor"),
+        }
+        for name, (keys, measure) in specs.items():
+            df = result[name]
+            if df.empty:
+                continue
+            keys = [k for k in keys if k in df]
+            duplicate = df.duplicated(keys, keep=False)
+            if not duplicate.any():
+                continue
+            compare = [c for c in df if c != "source"]
+            result[name] = df.drop_duplicates(compare).copy()
+            df = result[name]
+            conflicting = df.duplicated(keys, keep=False)
+            for row in df.loc[df.duplicated(keys, keep=False)].itertuples(index=False):
+                self.issue(row.supplier, getattr(row, "sku", None), f"conflicting_{name}_key_excluded", "cross_source", "error")
+            # No defensible winner: omit ambiguous rows, preserving a specific issue.
+            result[name] = df.loc[~conflicting].reset_index(drop=True)
+            for supplier in self.suppliers:
+                if ((result[name].supplier == supplier).sum() != (self.rows_count(name, supplier))):
+                    self.issue(supplier, None, f"duplicate_{name}_rows_excluded", "cross_source")
+        tx = result["transactions"]
+        if not tx.empty:
+            keys = ["supplier", "sku", "date", "document_id", "warehouse"]
+            counts = tx.groupby(keys, dropna=False).source.transform("nunique")
+            cross_source = counts > 1
+            for supplier, sku in tx.loc[cross_source, ["supplier", "sku"]].drop_duplicates().itertuples(index=False):
+                self.issue(supplier, sku, "overlapping_transaction_documents_excluded", "cross_source", "error")
+            result["transactions"] = tx.loc[~cross_source].reset_index(drop=True)
+
+    def rows_count(self, name, supplier):
+        return sum(r["supplier"] == supplier for r in self.rows[name])
+
     def reconcile(self, result):
         monthly, transactions = result["monthly_sales"], result["transactions"]
         if monthly.empty or transactions.empty:
             return
         keys = ["supplier", "sku", "month"]
-        duplicate = monthly.duplicated(keys, keep=False)
-        for supplier, sku in monthly.loc[duplicate, ["supplier", "sku"]].drop_duplicates().itertuples(index=False):
-            self.issue(supplier, sku, "duplicate_monthly_key_excluded", "cross_source", "error")
-        # An overlapping report cannot be silently summed or preferred.
-        if duplicate.any():
-            monthly = monthly.loc[~duplicate].copy()
-            result["monthly_sales"] = monthly
         tx = transactions.assign(month=pd.to_datetime(transactions.date).dt.to_period("M").dt.to_timestamp())
-        sums = tx.groupby(keys, dropna=False).quantity.sum(min_count=1).rename("transaction_quantity").reset_index()
-        check = monthly.merge(sums, on=keys, how="inner")
+        sums = tx.groupby(keys, dropna=False).quantity.agg(lambda s: s.sum(min_count=len(s))).rename("transaction_quantity").reset_index()
+        check = monthly.merge(sums, on=keys, how="outer", indicator=True)
+        for (supplier, sku), group in check.loc[check._merge != "both"].groupby(["supplier", "sku"]):
+            self.issue(supplier, sku, "sales_history_coverage_differs_between_sources", "cross_source")
         known = check.quantity.notna() & check.transaction_quantity.notna()
+        for supplier, sku in check.loc[(check._merge == "both") & ~known, ["supplier", "sku"]].drop_duplicates().itertuples(index=False):
+            self.issue(supplier, sku, "reconciliation_incomplete_quantity", "cross_source")
         different = known & ~np.isclose(check.quantity, check.transaction_quantity, rtol=0, atol=1e-6)
         for (supplier, sku), group in check.loc[different].groupby(["supplier", "sku"]):
             months = ",".join(group.month.dt.strftime("%Y-%m"))
