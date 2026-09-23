@@ -8,11 +8,14 @@ import traceback
 import numpy as np
 import pandas as pd
 import streamlit as st
+from engine import ENGINE_CAPABILITIES
 
 from demo_data import DEMO_DATE, make_demo_dataset
 from export import build_approved_csv
 from order_review import make_review, merge_visible_edits, review_signature, validate_selection
-from ui_integration import input_signature, load_uploads, run_calculation
+from ui_integration import input_signature, load_uploads, run_calculation, upload_key, named_supplier, SUPPLIERS
+from ai_assistant import (AIConfig, EXPLAIN, CLARIFY, build_context, collect_sku_issues,
+                          read_config, session_explanation, sync_ai_state)
 
 st.set_page_config(page_title='StockPilot · Заказы поставщикам', page_icon='↗', layout='wide')
 
@@ -94,11 +97,13 @@ def clear_approval():
         st.session_state.confirm_review = False
 
 
-def calculate(mode, uploads, settings, signature):
+def calculate(mode, uploads, settings, signature, supplier_choices=None):
     clear_approval()
-    source_id = input_signature(mode, uploads, {})
+    st.session_state.ai_cache = {}
+    st.session_state.ai_active_key = None
+    source_id = input_signature(mode, uploads, {}, supplier_choices)
     if st.session_state.get('loaded_source_id') != source_id:
-        data = make_demo_dataset() if mode == 'Демонстрация' else load_uploads(uploads)
+        data = make_demo_dataset() if mode == 'Демонстрация' else load_uploads(uploads, supplier_choices)
     else:
         data = st.session_state.dataset
     result, prepared = run_calculation(data, settings)
@@ -106,6 +111,7 @@ def calculate(mode, uploads, settings, signature):
     st.session_state.update(result=result, prepared=prepared, draft=draft, dataset=data, loaded_source_id=source_id,
         calculation_id=signature, calculated_settings=settings,
         calculated_mode=mode, calculated_files=[name for name, _ in uploads],
+        calculated_supplier_choices=dict(supplier_choices or {}),
         calculated_at=datetime.now().strftime('%H:%M:%S'), revision=st.session_state.get('revision', 0) + 1)
     st.session_state.pop('calculation_error', None)
 
@@ -117,11 +123,20 @@ def sidebar():
         st.divider()
         st.markdown('### Источник данных')
         mode = st.radio('Режим работы', ['Демонстрация', 'Мои файлы'], key='source_mode', horizontal=True)
-        uploads = []
+        uploads, supplier_choices = [], {}
         if mode == 'Мои файлы':
             files = st.file_uploader('Выгрузки поставщиков', type=['zip', 'xlsx'], accept_multiple_files=True, key='files',
                 help='Архивы Systeme Electric и IEK или исходные XLSX. Названия файлов сохраняют поставщика.')
             uploads = [(f.name, f.getvalue()) for f in files]
+            for name, content in uploads:
+                if Path(name).suffix.lower() == '.xlsx' and named_supplier(name) is None:
+                    identity = upload_key(name, content)
+                    if identity in supplier_choices:
+                        continue
+                    choice = st.selectbox(f'Поставщик файла «{name}»', ['Выберите поставщика', *SUPPLIERS],
+                        key='upload_supplier_' + identity,
+                        help='При загрузке отдельного XLSX исходная папка теряется. Укажите поставщика вручную.')
+                    supplier_choices[identity] = choice if choice in SUPPLIERS else None
             st.caption('Файлы читаются локально. Исходники не изменяются.')
         else:
             st.caption('8 вымышленных товаров · 2 поставщика\n\nРекомендации меняются вместе с параметрами заказа.')
@@ -168,16 +183,29 @@ def sidebar():
                     constraints[supplier_name] = supplied
             st.caption('Условия из файлов имеют приоритет. Общая настройка применяется только к отсутствующим значениям и должна подходить каждому такому товару.')
         with st.expander('Возможности прогноза'):
-            st.checkbox('Исключать разовые аномалии', value=False, disabled=True)
-            st.checkbox('Восстанавливать спрос при stockout', value=False, disabled=True)
-            st.caption('В текущей версии доступны базовый прогноз и сезонность. Аномалии, устойчивый тренд и stockout ещё не реализованы.')
+            exclude_anomalies = st.checkbox('Исключать разовые аномалии', value=False,
+                disabled=not ENGINE_CAPABILITIES.get('exclude_anomalies'), key='exclude_anomalies')
+            restore_stockouts = st.checkbox('Восстанавливать спрос при stockout', value=False,
+                disabled=not ENGINE_CAPABILITIES.get('restore_stockouts'), key='restore_stockouts')
+            enable_trend = st.checkbox('Учитывать устойчивый рост спроса', value=True,
+                disabled=not ENGINE_CAPABILITIES.get('trend'), key='enable_trend')
+            st.caption('Коррекции применяются только при пригодных данных. Пустые stockout и отсутствие ID клиентов остаются ограничениями.')
         settings = dict(as_of=as_of, lead_time_days={'Systeme Electric': lead_se, 'IEK': lead_iek},
             review_period_days=review, default_safety_days=safety, safety_days_by_category=category_map,
-            exclude_anomalies=False, restore_stockouts=False,
+            exclude_anomalies=exclude_anomalies, restore_stockouts=restore_stockouts, enable_trend=enable_trend,
             confirmed_warehouse_scope=confirmed_scopes, order_constraints_by_supplier=constraints)
         pressed = st.button('Рассчитать заказ', type='primary', width='stretch', key='calculate')
         st.caption('Изменения параметров требуют пересчёта и нового утверждения.')
-    return mode, uploads, settings, pressed
+        local_config = read_config()
+        with st.expander('AI-пояснения · OpenAI'):
+            if st.session_state.get('ai_config_model') != local_config.model:
+                st.session_state.ai_model = local_config.model
+                st.session_state.ai_config_model = local_config.model
+            model = st.text_input('Модель OpenAI', key='ai_model', help='ID модели из вашего аккаунта. Доступ проверяется только при запросе пояснения.')
+            ai_config = AIConfig(api_key=local_config.api_key, model=model.strip())
+            st.caption('Ключ найден локально.' if local_config.api_key else 'Ключ не настроен. Формула и диагностика работают без AI.')
+            st.caption('Запрос отправляется только по кнопке: сводка выбранного товара, без архивов, клиентов и путей файлов. Смена модели очищает пояснения, сохраняя заказ.')
+    return mode, uploads, settings, pressed, supplier_choices, ai_config
 
 
 def orders_tab(stale):
@@ -286,7 +314,38 @@ def orders_tab(stale):
         st.caption('CSV в UTF-8 для Excel. Автоматической отправки поставщикам нет. Состояние текущей сессии не заменяет сохранённый файл.')
 
 
-def details_tab():
+def ai_block(row, issues, stale, config):
+    st.markdown('#### Пояснение и вопросы менеджеру')
+    question = CLARIFY if row.data_quality == 'insufficient' else EXPLAIN
+    context = build_context(row, calculation_id=st.session_state.calculation_id,
+        as_of=st.session_state.calculated_settings['as_of'], source_mode=st.session_state.calculated_mode, issues=issues)
+    st.caption('AI помогает разобрать готовый результат. Формула, количества и утверждение остаются под вашим контролем.')
+    pressed = st.button(question, key='explain_sku', disabled=stale)
+    if stale:
+        st.caption('Сначала пересчитайте заказ: предыдущее AI-пояснение больше не актуально.')
+        return
+    if pressed:
+        with st.spinner('Готовим пояснение выбранного товара…'):
+            response = session_explanation(st.session_state, context, question=question, config=config, run=True)
+    else:
+        response = session_explanation(st.session_state, context, question=question, config=config)
+    if response:
+        if response['status'] == 'ok':
+            st.caption(f"AI-пояснение · {response['provider']} · {response['model']} · только текущий расчёт")
+            st.text(response['summary'])
+            if response['questions_to_manager']:
+                st.markdown('**Вопросы менеджеру**')
+                for number, item in enumerate(response['questions_to_manager'], 1):
+                    st.text(f'{number}. {item}')
+            st.caption('Основания: ' + ', '.join(response['evidence_ids']))
+        else:
+            st.warning(response['summary'])
+    with st.expander('Сводка для пояснения и ссылки на основания'):
+        st.caption('Отправляется только обезличенная сводка. fact:<поле> ссылается на значение facts, quality — на статус данных.')
+        st.json(context)
+
+
+def details_tab(stale, ai_config):
     orders = st.session_state.result['orders']
     st.subheader('Почему предлагается такое количество')
     keys = [f'{r.supplier} / {r.sku} — {r["name"]}' for _, r in orders.iterrows()]
@@ -302,6 +361,16 @@ def details_tab():
         col.metric(label, fmt(value))
     st.markdown(f'<div class="formula"><strong>Рекомендация: {escape(fmt(row.recommended_qty))} {escape(str(row.unit))}</strong><br>{escape(str(row.reason))}</div>', unsafe_allow_html=True)
     st.caption('Дата остатка: ' + (str(pd.Timestamp(row.stock_as_of).date()) if pd.notna(row.stock_as_of) else 'нет подтверждённого снимка'))
+    issues = collect_sku_issues(row, st.session_state.prepared.get('quality_report'), st.session_state.result['diagnostics'])
+    if row.data_quality == 'insufficient':
+        st.error('Первая причина блокировки: ' + str(row.reason))
+    if issues:
+        with st.expander('Все замечания выбранного товара', expanded=row.data_quality == 'insufficient'):
+            report = pd.DataFrame(issues)
+            report['issue'] = report.issue.map(readable_issue)
+            st.dataframe(report.rename(columns={**LABELS, 'stage': 'Этап', 'evidence_id': 'Основание', 'code': 'Код для пояснения'}),
+                hide_index=True, width='stretch')
+    ai_block(row, issues, stale, ai_config)
     history = st.session_state.dataset['monthly_sales']
     history = history.loc[history.supplier.eq(row.supplier) & history.sku.eq(row.sku)].copy()
     forecast = st.session_state.result['forecast']
@@ -333,7 +402,15 @@ def details_tab():
         if not subset.empty:
             subset['issue'] = subset.issue.map(readable_issue)
             st.dataframe(subset.rename(columns=LABELS), hide_index=True, width='stretch')
-    st.info('Исключение аномалий, устойчивый тренд и восстановление stockout ещё не реализованы. Пустая таблица аномалий не означает отсутствие аномалий в продажах.')
+    st.markdown('#### Проверка аномалий')
+    anomalies = st.session_state.result['anomalies']
+    anomalies = anomalies.loc[anomalies.supplier.eq(row.supplier) & anomalies.sku.eq(row.sku)]
+    if anomalies.empty:
+        st.info('Записей аномалий для товара нет. Проверьте включение коррекции и диагностику: это не доказывает отсутствие выбросов.')
+    else:
+        st.dataframe(anomalies.rename(columns={**LABELS, 'date': 'Дата', 'quantity': 'Количество',
+            'excluded': 'Исключена', 'document_id': 'Документ'}), hide_index=True, width='stretch')
+    st.caption('Тренд и коррекции отражаются в прогнозе после пересчёта. Без подтверждённых интервалов stockout восстановление не выполняется. Отсутствие ID клиентов ограничивает проверку повторных покупок.')
 
 
 def data_tab():
@@ -372,12 +449,13 @@ def data_tab():
 
 def main():
     style()
-    mode, uploads, settings, pressed = sidebar()
-    signature = input_signature(mode, uploads, settings)
+    mode, uploads, settings, pressed, supplier_choices, ai_config = sidebar()
+    signature = input_signature(mode, uploads, settings, supplier_choices)
+    sync_ai_state(st.session_state, signature, ai_config)
     if pressed or ('result' not in st.session_state and mode == 'Демонстрация' and 'calculation_error' not in st.session_state):
         try:
             with st.spinner('Читаем данные и рассчитываем рекомендации…'):
-                calculate(mode, uploads, settings, signature)
+                calculate(mode, uploads, settings, signature, supplier_choices)
         except Exception as exc:
             # No silent switch to demo: keep the failure explicit and block exports.
             clear_approval()
@@ -417,7 +495,7 @@ def main():
         with tabs[0]:
             orders_tab(stale)
         with tabs[1]:
-            details_tab()
+            details_tab(stale, ai_config)
     with tabs[2]:
         data_tab()
     st.markdown('<div class="foot">StockPilot · HackAlem AI &nbsp; / &nbsp; Нурасыл — данные · Гапар — расчёты · Рамазан — интерфейс</div>', unsafe_allow_html=True)

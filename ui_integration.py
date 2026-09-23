@@ -11,11 +11,28 @@ from zipfile import BadZipFile, ZipFile
 import pandas as pd
 
 MAX_TOTAL_BYTES = 80 * 1024 * 1024
+SUPPLIERS = ('IEK', 'Systeme Electric')
 
 
-def input_signature(mode, uploads, settings):
+def upload_key(name, content):
+    return sha256(name.encode('utf-8') + b'\0' + content).hexdigest()
+
+
+def named_supplier(name):
+    """Only the uploaded filename, never workbook cells or a temporary path."""
+    name = safe_upload_name(name).lower()
+    if 'system' in name or 'syseme' in name:
+        return 'Systeme Electric'
+    if re.search(r'iek|иэк', name):
+        return 'IEK'
+    return None
+
+
+def input_signature(mode, uploads, settings, supplier_choices=None):
     parts = [(name, sha256(content).hexdigest()) for name, content in uploads]
-    payload = json.dumps([mode, parts, settings], sort_keys=True, default=str, ensure_ascii=False)
+    choices = {upload_key(name, content): (supplier_choices or {}).get(upload_key(name, content))
+               for name, content in uploads}
+    payload = json.dumps([mode, parts, settings, choices], sort_keys=True, default=str, ensure_ascii=False)
     return sha256(payload.encode('utf-8')).hexdigest()
 
 
@@ -27,7 +44,7 @@ def safe_upload_name(name):
     return leaf
 
 
-def load_uploads(uploads):
+def load_uploads(uploads, supplier_choices=None):
     """Persist only for the synchronous loader call, keeping informative names."""
     if not uploads:
         raise ValueError('Добавьте хотя бы один ZIP или XLSX.')
@@ -38,6 +55,16 @@ def load_uploads(uploads):
         paths = []
         for number, (name, content) in enumerate(uploads):
             safe_name = safe_upload_name(name)
+            supplier = (supplier_choices or {}).get(upload_key(name, content))
+            if supplier is not None and supplier not in SUPPLIERS:
+                raise ValueError('Выберите поставщика из списка IEK / Systeme Electric.')
+            if Path(safe_name).suffix.lower() == '.xlsx':
+                detected = named_supplier(safe_name)
+                if supplier and detected and supplier != detected:
+                    raise ValueError('Выбранный поставщик не совпадает с именем файла.')
+                supplier = supplier or detected
+                if supplier is None:
+                    raise ValueError(f'Выберите поставщика для XLSX «{safe_name}».')
             # Both ZIP and XLSX are ZIP containers. Inspect without extracting.
             try:
                 with ZipFile(BytesIO(content)) as archive:
@@ -48,7 +75,9 @@ def load_uploads(uploads):
             except BadZipFile as exc:
                 raise ValueError(f'Файл «{safe_name}» не является исправным ZIP/XLSX.') from exc
             subfolder = Path(folder) / str(number)
-            subfolder.mkdir()
+            if Path(safe_name).suffix.lower() == '.xlsx':
+                subfolder = subfolder / supplier
+            subfolder.mkdir(parents=True)
             target = subfolder / safe_name
             target.write_bytes(content)
             paths.append(str(target))

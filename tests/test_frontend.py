@@ -8,7 +8,7 @@ import pytest
 
 from demo_data import make_demo_dataset, default_settings
 from order_review import make_review, merge_visible_edits, review_signature, validate_selection, row_key
-from ui_integration import prepare_for_engine, run_calculation, load_uploads, input_signature
+from ui_integration import prepare_for_engine, run_calculation, load_uploads, input_signature, upload_key
 
 
 @pytest.fixture
@@ -172,3 +172,59 @@ def test_app_empty_filters_and_source_view():
     assert any('ничего не найдено' in item.value for item in at.info)
     at.selectbox(key='source_table').set_value('seasonality').run()
     assert not at.exception
+
+
+def ambiguous_workbook():
+    from openpyxl import Workbook
+    wb = Workbook()
+    for row in [['Номенклатура', 'Номенклатура.Код', 'янв. 2026', 'фев. 2026'],
+                [None, None, 'Количество', 'Количество'], ['Systeme in product name', '0007', 12, 20]]:
+        wb.active.append(row)
+    content = BytesIO()
+    wb.save(content)
+    wb.close()
+    return 'Ежемесячные продажи в количественном выражении за последние 2 года.xlsx', content.getvalue()
+
+
+def test_ambiguous_xlsx_supplier_is_explicit_and_not_inferred_from_cells():
+    name, payload = ambiguous_workbook()
+    with pytest.raises(ValueError, match='Выберите поставщика'):
+        load_uploads([(name, payload)])
+    identity = upload_key(name, payload)
+    data = load_uploads([(name, payload)], {identity: 'IEK'})
+    assert data['products'].supplier.tolist() == ['IEK']
+    assert data['products'].sku.tolist() == ['0007']
+    assert not data['quality_report'].issue.eq('unrecognized_supplier_or_file_type').any()
+    assert data['products'].name.iloc[0] == 'Systeme in product name'
+    with pytest.raises(ValueError, match='списка'):
+        load_uploads([(name, payload)], {identity: '../../Systeme Electric'})
+    one = input_signature('real', [(name, payload)], {}, {identity: 'IEK'})
+    two = input_signature('real', [(name, payload)], {}, {identity: 'Systeme Electric'})
+    assert one != two
+
+
+def test_app_supplier_change_invalidates_calculation_approval_and_ai(monkeypatch):
+    import streamlit
+    from types import SimpleNamespace
+    name, payload = ambiguous_workbook()
+    monkeypatch.setattr(streamlit, 'file_uploader', lambda *a, **kw: [SimpleNamespace(name=name, getvalue=lambda: payload)])
+    at = app_test()
+    at.radio(key='source_mode').set_value('Мои файлы').run()
+    key = 'upload_supplier_' + upload_key(name, payload)
+    at.selectbox(key=key).set_value('IEK').run()
+    at.button(key='calculate').click().run()
+    assert not at.exception
+    previous_id = at.session_state['calculation_id']
+    assert at.session_state['dataset']['products'].supplier.eq('IEK').all()
+    at.session_state['approval'] = {'signature': 'previous'}
+    at.session_state['ai_cache'] = {'old': {'status': 'ok'}}
+    at.selectbox(key=key).set_value('Systeme Electric').run()
+    assert not at.exception
+    assert 'approval' not in at.session_state
+    assert at.session_state['ai_cache'] == {}
+    assert at.button(key='approve').disabled
+    assert at.button(key='explain_sku').disabled
+    at.button(key='calculate').click().run()
+    assert not at.exception
+    assert at.session_state['calculation_id'] != previous_id
+    assert at.session_state['dataset']['products'].supplier.eq('Systeme Electric').all()
