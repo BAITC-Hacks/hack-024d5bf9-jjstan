@@ -30,9 +30,11 @@ SCHEMAS = {
     "stockouts": "supplier sku warehouse start_date end_date".split(),
     "quality_report": "supplier sku severity issue source".split(),
 }
-DATE_COLUMNS = {"month", "date", "as_of", "expected_date", "start_date", "end_date", "report_month", "snapshot_as_of"}
+DATE_COLUMNS = {"month", "date", "as_of", "expected_date", "start_date", "end_date", "report_month", "snapshot_as_of",
+                "period_start", "period_end"}
 NUMBER_COLUMNS = {"quantity", "free_stock", "min_order_qty", "pack_multiple", "factor",
-                  "raw_quantity", "stock_quantity", "growth_coefficient_raw", "seasonality_coefficient_raw"}
+                  "raw_quantity", "stock_quantity", "growth_coefficient_raw", "seasonality_coefficient_raw",
+                  "reconciled_transaction_quantity", "reconciliation_difference"}
 MONTHS = {v: i for i, v in enumerate(
     ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"], 1)}
 SKU_HEADERS = {"код", "код 1с", "номенклатура.код"}
@@ -112,11 +114,11 @@ class _Loader:
         self.cutoffs = {}
         self.conflicts = defaultdict(set)
 
-    def issue(self, supplier, sku, issue, source, severity="warning"):
+    def issue(self, supplier, sku, issue, source, severity="warning", **details):
         key = (supplier, sku, severity, issue, source)
         if key not in self.issues:
             self.issues.add(key)
-            self.rows["quality_report"].append(dict(zip(SCHEMAS["quality_report"], key)))
+            self.rows["quality_report"].append(dict(zip(SCHEMAS["quality_report"], key), **details))
 
     def number(self, value, supplier, sku, source):
         if value is None or _text(value) is None:
@@ -415,7 +417,9 @@ class _Loader:
             if mask.any():
                 monthly.loc[mask, "is_complete"] = (pd.to_datetime(monthly.loc[mask,"month"]) + pd.offsets.MonthEnd(0)) <= cutoff
         self.reconcile(result)
-        result["quality_report"] = pd.DataFrame(self.rows["quality_report"], columns=SCHEMAS["quality_report"])
+        quality = pd.DataFrame(self.rows["quality_report"])
+        required = SCHEMAS["quality_report"]
+        result["quality_report"] = quality.reindex(columns=required + [c for c in quality if c not in required])
         for df in result.values():
             for col in df.columns:
                 if col in DATE_COLUMNS:
@@ -488,7 +492,12 @@ class _Loader:
 
     def reconcile(self, result):
         monthly, transactions = result["monthly_sales"], result["transactions"]
-        if monthly.empty or transactions.empty:
+        if monthly.empty:
+            return
+        monthly["reconciled_transaction_quantity"] = np.nan
+        monthly["reconciliation_difference"] = np.nan
+        monthly["reconciliation_status"] = "transactions_unavailable"
+        if transactions.empty:
             return
         keys = ["supplier", "sku", "month"]
         tx = transactions.assign(month=pd.to_datetime(transactions.date).dt.to_period("M").dt.to_timestamp())
@@ -500,9 +509,24 @@ class _Loader:
         for supplier, sku in check.loc[(check._merge == "both") & ~known, ["supplier", "sku"]].drop_duplicates().itertuples(index=False):
             self.issue(supplier, sku, "reconciliation_incomplete_quantity", "cross_source")
         different = known & ~np.isclose(check.quantity, check.transaction_quantity, rtol=0, atol=1e-6)
+        # Numerical agreement is evidence, not approval of warehouse scope or completeness.
+        check["reconciliation_status"] = "no_transaction_rows"
+        both = check._merge == "both"
+        check.loc[both & ~known, "reconciliation_status"] = "incomplete_quantity"
+        check.loc[both & known & ~different, "reconciliation_status"] = "matched"
+        check.loc[both & different, "reconciliation_status"] = "mismatch"
+        check["reconciliation_difference"] = check.quantity - check.transaction_quantity
+        evidence = check.loc[check._merge != "right_only", keys + [
+            "transaction_quantity", "reconciliation_difference", "reconciliation_status"]].rename(
+                columns={"transaction_quantity": "reconciled_transaction_quantity"})
+        result["monthly_sales"] = monthly.drop(columns=[
+            "reconciled_transaction_quantity", "reconciliation_difference", "reconciliation_status"
+        ]).merge(evidence, on=keys, how="left", validate="one_to_one")
         for (supplier, sku), group in check.loc[different].groupby(["supplier", "sku"]):
-            months = ",".join(group.month.dt.strftime("%Y-%m"))
-            self.issue(supplier, sku, f"monthly_transaction_mismatch:{months}", "cross_source", "error")
+            months = ",".join(group.month.sort_values().dt.strftime("%Y-%m"))
+            self.issue(supplier, sku, f"monthly_transaction_mismatch:{months}", "cross_source", "error",
+                       affected_tables="monthly_sales,transactions", affected_months=months,
+                       period_start=group.month.min(), period_end=group.month.max() + pd.offsets.MonthEnd(0))
         for supplier in check.supplier.unique():
             subset = check.supplier == supplier
             count = int((known & ~different & subset).sum())
