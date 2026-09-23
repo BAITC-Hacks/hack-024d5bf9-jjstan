@@ -290,3 +290,75 @@ def test_broken_later_snapshot_does_not_invalidate_valid_stock(tmp_path):
     data=load_data([good,str(bad)])
     assert data['stock'].is_current.all()
     assert data['transit'].quantity.tolist()==[2]
+
+
+def test_reconciliation_evidence_preserves_months_and_returns(tmp_path):
+    sales=book(tmp_path,'Ежемесячные продажи Systeme.xlsx',[
+        ['Код 1с','янв. 2026','февр. 2026','март 2026','апр. 2026','май 2026'],
+        ['001_',8,9,4,None,5]])
+    tx=book(tmp_path,'Динамика Systeme.xlsx',[
+        ['Код','Дата','Номер','Документ','Количество'],
+        ['001_','01.01.2026','A','Расходная накладная A',10],
+        ['001_','02.01.2026','B','Возврат от покупателя B',2],
+        ['001_','01.02.2026','C','Расходная накладная C',3],
+        ['001_','01.03.2026','D','Неизвестная операция',4],
+        ['001_','01.04.2026','E','Расходная накладная E',2]])
+    data=load_data([sales,tx])
+    m=data['monthly_sales']
+    assert m.reconciliation_status.tolist()==[
+        'matched','mismatch','incomplete_quantity','incomplete_quantity','no_transaction_rows']
+    assert m.reconciled_transaction_quantity.iloc[:2].tolist()==[8,3]
+    assert m.reconciliation_difference.iloc[:2].tolist()==[0,6]
+    assert m.reconciliation_difference.iloc[2:].isna().all()
+    assert m.quantity.iloc[:3].tolist()==[8,9,4]
+    assert pd.isna(m.quantity.iloc[3])
+    error=data['quality_report'].loc[data['quality_report'].issue.str.startswith('monthly_transaction_mismatch')].iloc[0]
+    assert error.severity=='error'
+    assert error.affected_months=='2026-02'
+    assert error.period_start==pd.Timestamp('2026-02-01')
+    assert error.period_end==pd.Timestamp('2026-02-28')
+
+
+def test_reconciliation_does_not_match_another_supplier(tmp_path):
+    sales=book(tmp_path,'Ежемесячные продажи Systeme.xlsx',[
+        ['Код 1с','янв. 2026'],['001_',8]])
+    tx=book(tmp_path,'Динамика IEK.xlsx',[
+        ['Код','Дата','Номер','Документ','Количество'],
+        ['001_','01.01.2026','A','Расходная накладная A',8]])
+    data=load_data([sales,tx])
+    assert data['monthly_sales'].reconciliation_status.tolist()==['no_transaction_rows']
+    assert data['monthly_sales'].reconciled_transaction_quantity.isna().all()
+    without_tx=load_data([sales])
+    assert without_tx['monthly_sales'].reconciliation_status.tolist()==['transactions_unavailable']
+    assert without_tx['monthly_sales'].reconciled_transaction_quantity.isna().all()
+
+
+def test_reconciliation_reports_exact_noncontiguous_months(tmp_path):
+    sales=book(tmp_path,'Ежемесячные продажи IEK.xlsx',[
+        ['Код 1с','март 2026','янв. 2026','февр. 2026'],['01',4,4,3]])
+    tx=book(tmp_path,'Динамика IEK.xlsx',[
+        ['Код','Дата','Номер','Документ','Количество'],
+        ['01','01.01.2026','A','Расходная накладная A',3],
+        ['01','01.02.2026','B','Расходная накладная B',3],
+        ['01','01.03.2026','C','Расходная накладная C',3]])
+    data=load_data([sales,tx])
+    row=data['quality_report'].loc[data['quality_report'].issue.str.startswith('monthly_transaction_mismatch')].iloc[0]
+    assert row.affected_months=='2026-01,2026-03'
+    assert row.period_start==pd.Timestamp('2026-01-01')
+    assert row.period_end==pd.Timestamp('2026-03-31')
+    assert row.issue=='monthly_transaction_mismatch:2026-01,2026-03'
+    assert data['monthly_sales'].set_index('month').loc[pd.Timestamp('2026-02-01'),'reconciliation_status']=='matched'
+
+
+def test_reconciliation_distinguishes_explicit_zero_from_absent_rows(tmp_path):
+    sales=book(tmp_path,'Ежемесячные продажи IEK.xlsx',[
+        ['Код 1с','янв. 2026'],['01',0],['02',0]])
+    tx=book(tmp_path,'Динамика IEK.xlsx',[
+        ['Код','Дата','Номер','Документ','Количество'],
+        ['01','01.01.2026','A','Расходная накладная A',2],
+        ['01','02.01.2026','B','Возврат от покупателя B',2]])
+    monthly=load_data([sales,tx])['monthly_sales'].set_index('sku')
+    assert monthly.loc['01','reconciliation_status']=='matched'
+    assert monthly.loc['01','reconciled_transaction_quantity']==0
+    assert monthly.loc['02','reconciliation_status']=='no_transaction_rows'
+    assert pd.isna(monthly.loc['02','reconciled_transaction_quantity'])
