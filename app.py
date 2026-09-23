@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 from engine import ENGINE_CAPABILITIES
 
-from demo_data import DEMO_DATE, make_demo_dataset
+from demo_data import DEMO_DATE, DEMO_SCENARIOS, make_demo_case
 from export import build_approved_csv
 from order_review import make_review, merge_visible_edits, review_signature, validate_selection
 from ui_integration import input_signature, load_uploads, run_calculation, upload_key, named_supplier, SUPPLIERS
@@ -97,21 +97,51 @@ def clear_approval():
         st.session_state.confirm_review = False
 
 
-def calculate(mode, uploads, settings, signature, supplier_choices=None):
+def reset_demo_controls(scenario):
+    """Apply a preset before rendering widgets, without confirming any order."""
+    _, preset = make_demo_case(scenario)
+    st.session_state.update(as_of=pd.Timestamp(preset['as_of']).date(),
+        lead_se=preset['lead_time_days'].get('Systeme Electric', 7),
+        lead_iek=preset['lead_time_days'].get('IEK', 7),
+        review=preset['review_period_days'], safety=preset['default_safety_days'],
+        exclude_anomalies=preset['exclude_anomalies'], restore_stockouts=preset['restore_stockouts'],
+        enable_trend=preset['enable_trend'])
+    for key in list(st.session_state):
+        if key.startswith('category_') or key in {
+            'supplier_filter', 'search', 'status_filter', 'details_sku',
+            'scope_confirm_se', 'scope_confirm_iek', 'min_order_qty_confirm_se',
+            'min_order_qty_confirm_iek', 'pack_multiple_confirm_se', 'pack_multiple_confirm_iek',
+        }:
+            del st.session_state[key]
+    clear_approval()
+
+
+def calculate(mode, uploads, settings, signature, supplier_choices=None, demo_scenario=None):
     clear_approval()
     st.session_state.ai_cache = {}
     st.session_state.ai_active_key = None
-    source_id = input_signature(mode, uploads, {}, supplier_choices)
+    source_context = {'demo_scenario': demo_scenario} if mode == 'Демонстрация' else {}
+    source_id = input_signature(mode, uploads, source_context, supplier_choices)
     if st.session_state.get('loaded_source_id') != source_id:
-        data = make_demo_dataset() if mode == 'Демонстрация' else load_uploads(uploads, supplier_choices)
+        data = make_demo_case(demo_scenario)[0] if mode == 'Демонстрация' else load_uploads(uploads, supplier_choices)
     else:
         data = st.session_state.dataset
     result, prepared = run_calculation(data, settings)
     draft = make_review(result['orders'], data['products'], settings)
+    comparison = None
+    if mode == 'Демонстрация' and demo_scenario != 'overview':
+        flag = DEMO_SCENARIOS[demo_scenario]['flag']
+        enabled = settings[flag]
+        opposite, _ = run_calculation(data, dict(settings, **{flag: not enabled}))
+        current_row, opposite_row = result['orders'].iloc[0], opposite['orders'].iloc[0]
+        comparison = dict(before=(opposite_row if enabled else current_row).recommended_qty,
+            after=(current_row if enabled else opposite_row).recommended_qty,
+            unit=current_row.unit, enabled=enabled)
     st.session_state.update(result=result, prepared=prepared, draft=draft, dataset=data, loaded_source_id=source_id,
         calculation_id=signature, calculated_settings=settings,
         calculated_mode=mode, calculated_files=[name for name, _ in uploads],
         calculated_supplier_choices=dict(supplier_choices or {}),
+        calculated_demo_scenario=demo_scenario, demo_comparison=comparison,
         calculated_at=datetime.now().strftime('%H:%M:%S'), revision=st.session_state.get('revision', 0) + 1)
     st.session_state.pop('calculation_error', None)
 
@@ -124,6 +154,7 @@ def sidebar():
         st.markdown('### Источник данных')
         mode = st.radio('Режим работы', ['Демонстрация', 'Мои файлы'], key='source_mode', horizontal=True)
         uploads, supplier_choices = [], {}
+        demo_scenario = None
         if mode == 'Мои файлы':
             files = st.file_uploader('Выгрузки поставщиков', type=['zip', 'xlsx'], accept_multiple_files=True, key='files',
                 help='Архивы Systeme Electric и IEK или исходные XLSX. Названия файлов сохраняют поставщика.')
@@ -139,7 +170,14 @@ def sidebar():
                     supplier_choices[identity] = choice if choice in SUPPLIERS else None
             st.caption('Файлы читаются локально. Исходники не изменяются.')
         else:
-            st.caption('8 вымышленных товаров · 2 поставщика\n\nРекомендации меняются вместе с параметрами заказа.')
+            demo_scenario = st.selectbox('Сценарий демонстрации', list(DEMO_SCENARIOS),
+                format_func=lambda key: DEMO_SCENARIOS[key]['label'], key='demo_scenario')
+            st.caption(DEMO_SCENARIOS[demo_scenario]['description'])
+            st.caption('При смене сценария восстанавливаются его дата и параметры. Нажмите «Рассчитать заказ».')
+        source_selection = (mode, demo_scenario)
+        if mode == 'Демонстрация' and st.session_state.get('source_selection', source_selection) != source_selection:
+            reset_demo_controls(demo_scenario)
+        st.session_state.source_selection = source_selection
         st.divider()
         st.markdown('### Параметры заказа')
         as_of = st.date_input('Дата расчёта', value=DEMO_DATE.date(), key='as_of')
@@ -152,10 +190,11 @@ def sidebar():
         st.caption('Сроки и страховой запас — настройки менеджера, не подтверждённые условия поставщика.')
         category_map = {}
         with st.expander('Страховой запас по категориям'):
-            if st.session_state.get('calculated_mode') == mode and 'dataset' in st.session_state:
+            if (st.session_state.get('calculated_mode') == mode and 'dataset' in st.session_state
+                    and st.session_state.get('calculated_demo_scenario') == demo_scenario):
                 categories = sorted(st.session_state.dataset['products'].category.dropna().astype(str).unique())
             else:
-                categories = ['A', 'B', 'C'] if mode == 'Демонстрация' else []
+                categories = (['A', 'B', 'C'] if demo_scenario == 'overview' else ['A']) if mode == 'Демонстрация' else []
             if categories:
                 policy = pd.DataFrame({'category': categories, 'days': [int(safety)] * len(categories)})
                 key = 'category_' + hashlib.sha256(str((mode, categories, safety)).encode()).hexdigest()[:12]
@@ -182,7 +221,7 @@ def sidebar():
                 if supplied:
                     constraints[supplier_name] = supplied
             st.caption('Условия из файлов имеют приоритет. Общая настройка применяется только к отсутствующим значениям и должна подходить каждому такому товару.')
-        with st.expander('Возможности прогноза'):
+        with st.expander('Возможности прогноза', expanded=mode == 'Демонстрация' and demo_scenario != 'overview'):
             exclude_anomalies = st.checkbox('Исключать разовые аномалии', value=False,
                 disabled=not ENGINE_CAPABILITIES.get('exclude_anomalies'), key='exclude_anomalies')
             restore_stockouts = st.checkbox('Восстанавливать спрос при stockout', value=False,
@@ -207,7 +246,7 @@ def sidebar():
             ai_config = AIConfig(api_key=local_config.api_key, model=model.strip())
             st.caption('Ключ найден локально.' if local_config.api_key else 'Ключ не настроен. Формула и диагностика работают без AI.')
             st.caption('Запрос отправляется только по кнопке: сводка выбранного товара, без архивов, клиентов и путей файлов. Смена модели очищает пояснения, сохраняя заказ.')
-    return mode, uploads, settings, pressed, supplier_choices, ai_config
+    return mode, uploads, settings, pressed, supplier_choices, ai_config, demo_scenario
 
 
 def orders_tab(stale):
@@ -454,13 +493,14 @@ def data_tab():
 
 def main():
     style()
-    mode, uploads, settings, pressed, supplier_choices, ai_config = sidebar()
-    signature = input_signature(mode, uploads, settings, supplier_choices)
+    mode, uploads, settings, pressed, supplier_choices, ai_config, demo_scenario = sidebar()
+    signature_settings = dict(settings, demo_scenario=demo_scenario) if mode == 'Демонстрация' else settings
+    signature = input_signature(mode, uploads, signature_settings, supplier_choices)
     sync_ai_state(st.session_state, signature, ai_config)
     if pressed or ('result' not in st.session_state and mode == 'Демонстрация' and 'calculation_error' not in st.session_state):
         try:
             with st.spinner('Читаем данные и рассчитываем рекомендации…'):
-                calculate(mode, uploads, settings, signature, supplier_choices)
+                calculate(mode, uploads, settings, signature, supplier_choices, demo_scenario)
         except Exception as exc:
             # No silent switch to demo: keep the failure explicit and block exports.
             clear_approval()
@@ -492,6 +532,20 @@ def main():
     metrics[2].metric('Требуют данных', int(orders.data_quality.eq('insufficient').sum()))
     metrics[3].metric('Поставщиков', int(orders.supplier.nunique()))
     st.caption(f'Результат: {st.session_state.calculated_mode} · {st.session_state.calculated_settings["as_of"]} · рассчитан в {st.session_state.calculated_at}. Количества разных единиц не суммируются.')
+    if st.session_state.calculated_mode == 'Демонстрация':
+        calculated_scenario = st.session_state.get('calculated_demo_scenario') or 'overview'
+        st.caption('Сценарий результата: ' + DEMO_SCENARIOS[calculated_scenario]['label'])
+    comparison = st.session_state.get('demo_comparison')
+    if mode == 'Демонстрация' and comparison is not None and not stale:
+        spec = DEMO_SCENARIOS[demo_scenario]
+        st.subheader('Как алгоритм меняет рекомендацию')
+        before, after = st.columns(2)
+        before.metric(spec['before'], f'{fmt(comparison["before"])} {comparison["unit"]}')
+        after.metric(spec['after'], f'{fmt(comparison["after"])} {comparison["unit"]}')
+        st.caption('Оба результата рассчитаны на одних данных и параметрах; отличается только соответствующая коррекция. '
+            'Это рекомендации, а не утверждённые количества.')
+        st.caption('В таблице заказов коррекция ' + ('включена.' if comparison['enabled'] else 'выключена.')
+            + ' Измените переключатель в «Возможностях прогноза» и нажмите «Рассчитать заказ».')
     tabs = st.tabs(['Заказы', 'Объяснение SKU', 'Данные'])
     if orders.empty:
         with tabs[0]:

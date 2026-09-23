@@ -51,3 +51,29 @@ def default_settings():
     return dict(as_of=DEMO_DATE.date(), lead_time_days={'Systeme Electric': 7, 'IEK': 7},
         review_period_days=7, default_safety_days=2, safety_days_by_category={},
         exclude_anomalies=False, restore_stockouts=False)
+
+
+DEMO_SCENARIOS = {
+    'overview': dict(label='Обзор · 8 товаров',
+        description='8 вымышленных товаров двух поставщиков: расчёт, правка, утверждение и CSV.'),
+    'anomaly': dict(label='Разовый крупный заказ', example='anomaly_off', flag='exclude_anomalies',
+        description='К регулярным продажам добавлена одна сделка на 10 000 единиц. Сравните заказ с исключением этой сделки и без него.',
+        before='Без исключения аномалии', after='С исключением аномалии'),
+    'stockout': dict(label='Отсутствие товара (stockout)', example='stockout_off', flag='restore_stockouts',
+        description='В марте товар отсутствовал 15 дней. Сравните заказ по фактическим продажам и с восстановлением упущенного спроса.',
+        before='Без компенсации stockout', after='С компенсацией stockout'),
+    'trend': dict(label='Устойчивый рост спроса', example='trend_off', flag='enable_trend',
+        description='Среднедневные продажи растут шесть месяцев подряд. Сравните заказ по среднему спросу и с учётом тренда.',
+        before='Без учёта тренда', after='С учётом тренда'),
+}
+
+
+def make_demo_case(scenario='overview'):
+    """Reuse verified engine examples; each selection gets fresh synthetic data."""
+    spec = DEMO_SCENARIOS[scenario]
+    if scenario == 'overview':
+        return make_demo_dataset(), dict(default_settings(), enable_trend=True)
+    from engine_examples import make_examples
+    case = make_examples()[spec['example']]
+    case['dataset']['products']['name'] = 'Синтетический товар · ' + spec['label']
+    return case['dataset'], case['settings']
