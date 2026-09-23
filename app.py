@@ -198,6 +198,8 @@ def sidebar():
         st.caption('Изменения параметров требуют пересчёта и нового утверждения.')
         local_config = read_config()
         with st.expander('AI-пояснения · OpenAI'):
+            st.checkbox('Включить экспериментальные AI-пояснения', value=False, key='ai_enabled')
+            st.caption('Для защиты оставьте выключенным. При большом числе замечаний AI может потерять пояснение применимости исторической ошибки; живой запрос ещё не проверен.')
             if st.session_state.get('ai_config_model') != local_config.model:
                 st.session_state.ai_model = local_config.model
                 st.session_state.ai_config_model = local_config.model
@@ -316,6 +318,9 @@ def orders_tab(stale):
 
 def ai_block(row, issues, stale, config):
     st.markdown('#### Пояснение и вопросы менеджеру')
+    if not st.session_state.get('ai_enabled', False):
+        st.caption('AI выключен. Формула и полная диагностика доступны без API.')
+        return
     question = CLARIFY if row.data_quality == 'insufficient' else EXPLAIN
     context = build_context(row, calculation_id=st.session_state.calculation_id,
         as_of=st.session_state.calculated_settings['as_of'], source_mode=st.session_state.calculated_mode, issues=issues)

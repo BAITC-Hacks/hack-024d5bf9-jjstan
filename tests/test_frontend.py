@@ -209,6 +209,7 @@ def test_app_supplier_change_invalidates_calculation_approval_and_ai(monkeypatch
     name, payload = ambiguous_workbook()
     monkeypatch.setattr(streamlit, 'file_uploader', lambda *a, **kw: [SimpleNamespace(name=name, getvalue=lambda: payload)])
     at = app_test()
+    at.checkbox(key='ai_enabled').check().run()
     at.radio(key='source_mode').set_value('Мои файлы').run()
     key = 'upload_supplier_' + upload_key(name, payload)
     at.selectbox(key=key).set_value('IEK').run()

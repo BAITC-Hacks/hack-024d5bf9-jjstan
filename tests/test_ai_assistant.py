@@ -247,7 +247,10 @@ def test_all_sku_issues_include_supplier_findings_and_first_blocker():
 def app_test():
     from pathlib import Path
     from streamlit.testing.v1 import AppTest
-    return AppTest.from_file(str(Path(ai.__file__).with_name('app.py')), default_timeout=30).run()
+    at = AppTest.from_file(str(Path(ai.__file__).with_name('app.py')), default_timeout=30).run()
+    assert at.checkbox(key='ai_enabled').value is False
+    assert not any(button.key == 'explain_sku' for button in at.button)
+    return at.checkbox(key='ai_enabled').check().run()
 
 
 def test_app_ai_and_model_switch_preserve_approval(monkeypatch, client, config):
