@@ -107,11 +107,11 @@ def test_inputs_not_mutated(case):
         pd.testing.assert_frame_equal(data[key], original[key])
 
 
-def test_unimplemented_correction_blocks_instead_of_silent_skip(case):
+def test_malformed_transactions_block_instead_of_silent_skip(case):
     case[1]['exclude_anomalies'] = True
     case[0]['transactions'] = pd.DataFrame([dict(supplier='IEK', sku='001_', quantity=9999)])
     assert pd.isna(first(case)['recommended_qty'])
-    assert 'ещё не реализовано' in first(case)['reason']
+    assert 'недостаточно полей' in first(case)['reason']
 
 
 @pytest.mark.parametrize('raw,minimum,multiple,expected', [(70,24,12,72),(1,24,12,24),(0,24,12,0),(0.3,0,0.1,0.3)])
@@ -233,3 +233,301 @@ def test_loader_workbooks_to_engine(tmp_path):
     assert row.recommended_qty == 72, row.reason
     for key in data:
         pd.testing.assert_frame_equal(data[key], original[key])
+
+
+def test_direct_engine_rejects_old_snapshot(case):
+    case[0]['stock']['as_of'] = pd.Timestamp('2026-03-31')
+    row = first(case)
+    assert pd.isna(row.recommended_qty)
+    assert 'снимка' in row.reason and 'as_of' in row.reason
+
+
+@pytest.fixture
+def demand_case(case):
+    data, settings = deepcopy(case)
+    months = pd.date_range('2025-10-01', periods=6, freq='MS')
+    tx = []
+    for month in months:
+        for day in range(1, 21):
+            tx.append(dict(supplier='IEK', sku='001_', date=month+pd.Timedelta(days=day-1),
+                document_id=f'{month:%Y%m}-{day}', warehouse='__all__',
+                quantity=10.0, transaction_type='sale', customer_id=None, unit='шт'))
+    data['transactions'] = pd.DataFrame(tx)
+    data['monthly_sales'] = pd.DataFrame([dict(supplier='IEK', sku='001_', month=m,
+        quantity=200.0, is_complete=True) for m in months])
+    data['stock']['free_stock'] = 0.0
+    data['products']['min_order_qty'] = 0.0
+    data['products']['pack_multiple'] = 1.0
+    data['transit'] = data['transit'].iloc[:0]
+    settings['exclude_anomalies'] = True
+    settings['enable_trend'] = False
+    return data, settings
+
+
+def reconcile_months(data):
+    tx = data['transactions']
+    totals = tx.assign(month=tx.date.dt.to_period('M').dt.to_timestamp()).groupby('month').quantity.sum()
+    data['monthly_sales']['quantity'] = data['monthly_sales'].month.map(totals)
+
+
+def add_spike(data, quantity=10000.0, when='2026-03-15', document='bulk', **extra):
+    entry = dict(supplier='IEK', sku='001_', date=pd.Timestamp(when), document_id=document,
+        warehouse='__all__', quantity=quantity, transaction_type='sale', customer_id=None, unit='шт')
+    entry.update(extra)
+    data['transactions'] = pd.concat([data['transactions'], pd.DataFrame([entry])], ignore_index=True)
+    reconcile_months(data)
+
+
+def test_split_document_spike_does_not_inflate_regular_demand(demand_case):
+    data, settings = demand_case
+    original = first(demand_case).forecast_qty
+    for _ in range(20):
+        add_spike(data, quantity=500)
+    result = calculate_orders(data, settings)
+    assert result['orders'].iloc[0].forecast_qty == pytest.approx(original)
+    assert len(result['anomalies']) == 1
+    assert result['anomalies'].iloc[0].quantity == 10000
+    assert result['anomalies'].iloc[0].excluded
+    assert result['diagnostics'].issue.str.contains('Нет customer_id').any()
+
+
+def test_unreconciled_spike_is_not_removed(demand_case):
+    data, settings = demand_case
+    add_spike(data)
+    data['monthly_sales'].loc[data['monthly_sales'].month.eq(pd.Timestamp('2026-03-01')), 'quantity'] += 1
+    result = calculate_orders(data, settings)
+    assert pd.isna(result['orders'].iloc[0].recommended_qty)
+    assert not result['anomalies'].excluded.any()
+    assert 'не совпадают' in result['orders'].iloc[0].reason
+
+
+def test_return_stays_negative_and_is_not_anomaly(demand_case):
+    data, settings = demand_case
+    add_spike(data, quantity=-100, document='return', transaction_type='return')
+    baseline = first(demand_case).forecast_qty
+    add_spike(data)
+    result = calculate_orders(data, settings)
+    assert result['orders'].iloc[0].forecast_qty == pytest.approx(baseline)
+    assert result['anomalies'].document_id.tolist() == ['bulk']
+    assert data['transactions'].loc[data['transactions'].document_id.eq('return'), 'quantity'].iloc[0] == -100
+
+
+def test_repeated_large_demand_is_retained(demand_case):
+    data, settings = demand_case
+    for i, when in enumerate(['2026-03-01','2026-03-10','2026-03-20']):
+        add_spike(data, quantity=100, when=when, document=f'repeat-{i}')
+    enabled = calculate_orders(data, settings)
+    assert len(enabled['anomalies']) == 3
+    assert not enabled['anomalies'].excluded.any()
+    disabled = calculate_orders(data, dict(settings, exclude_anomalies=False))
+    assert enabled['orders'].iloc[0].forecast_qty == disabled['orders'].iloc[0].forecast_qty
+
+
+def test_growth_survives_anomaly_detection_and_is_bounded(demand_case):
+    data, settings = demand_case
+    for i, month in enumerate(data['monthly_sales'].month):
+        mask = data['transactions'].date.dt.to_period('M').eq(month.to_period('M'))
+        data['transactions'].loc[mask,'quantity'] = (10+i*3)*month.days_in_month/20
+    reconcile_months(data)
+    flat = first(demand_case).forecast_qty
+    settings['enable_trend'] = True
+    result = calculate_orders(data, settings)
+    grown = result['orders'].iloc[0].forecast_qty
+    assert flat < grown <= flat*1.5 + 1e-8
+    assert not result['anomalies'].excluded.any()
+    off = calculate_orders(data, dict(settings, exclude_anomalies=False))
+    assert off['orders'].iloc[0].forecast_qty == pytest.approx(grown)
+
+
+def test_seasonal_growth_coefficient_not_counted_twice(demand_case):
+    data, settings = demand_case
+    for i, month in enumerate(data['monthly_sales'].month):
+        factor = 1+i
+        data['seasonality'].loc[data['seasonality'].month_number.eq(month.month),'factor'] = factor
+        data['monthly_sales'].loc[data['monthly_sales'].month.eq(month),'quantity'] = 10*month.days_in_month*factor
+    settings.update(exclude_anomalies=False, enable_trend=True)
+    data['products']['growth_coefficient_raw'] = 999
+    assert first(demand_case).forecast_qty == pytest.approx(140)
+
+
+def stockout_rows(*intervals, **extra):
+    return pd.DataFrame([dict(supplier='IEK', sku='001_', warehouse='__all__',
+        start_date=pd.Timestamp(start), end_date=pd.Timestamp(end), **extra) for start,end in intervals])
+
+
+def test_stockout_increases_intensity_and_overlaps_count_once(case):
+    data, settings = case
+    data['monthly_sales']['quantity'] = 160.0  # 16 in-stock days at 10/day
+    raw = first(case).forecast_qty
+    settings['restore_stockouts'] = True
+    data['stockouts'] = stockout_rows(('2026-03-01','2026-03-10'), ('2026-03-06','2026-03-15'))
+    corrected = first(case).forecast_qty
+    assert corrected == pytest.approx(140)
+    assert corrected > raw
+    data['stockouts'] = stockout_rows(('2026-03-01','2026-03-15'))
+    assert first(case).forecast_qty == corrected
+
+
+def test_stockout_future_is_ignored_and_inputs_unchanged(case):
+    data, settings = case
+    settings['restore_stockouts'] = True
+    data['stockouts'] = stockout_rows(('2026-04-02','2026-06-01'))
+    before = deepcopy(data)
+    assert first(case).recommended_qty == 72
+    for key in data:
+        pd.testing.assert_frame_equal(data[key],before[key])
+
+
+@pytest.mark.parametrize('field,value', [('warehouse','Other'),('unit','м'),('confirmed',False)])
+def test_stockout_bad_scope_units_or_confirmation_blocks(case, field, value):
+    data, settings = case
+    settings['restore_stockouts'] = True
+    data['stockouts'] = stockout_rows(('2026-03-01','2026-03-15'))
+    data['stockouts'][field] = value
+    assert pd.isna(first(case).recommended_qty)
+
+
+def test_empty_stockouts_preserve_baseline_and_report_absence(case):
+    case[1]['restore_stockouts'] = True
+    result = calculate_orders(*case)
+    assert result['orders'].iloc[0].recommended_qty == 72
+    assert result['diagnostics'].issue.str.contains('Нет подтверждённых stockout').any()
+
+
+def test_algorithms_do_not_mutate_input(demand_case):
+    add_spike(demand_case[0])
+    before = deepcopy(demand_case)
+    calculate_orders(*demand_case)
+    assert demand_case[1] == before[1]
+    for key in before[0]:
+        pd.testing.assert_frame_equal(before[0][key], demand_case[0][key])
+
+
+def test_spike_in_future_or_incomplete_month_does_not_affect_fit(demand_case):
+    baseline = first(demand_case).forecast_qty
+    add_spike(demand_case[0], when='2026-04-10')
+    assert first(demand_case).forecast_qty == pytest.approx(baseline)
+
+
+def test_invalid_return_sign_blocks(demand_case):
+    add_spike(demand_case[0], quantity=100, transaction_type='return')
+    assert pd.isna(first(demand_case).recommended_qty)
+    assert 'знак' in first(demand_case).reason
+
+
+def test_scope_does_not_mix_warehouses(demand_case):
+    data, settings = demand_case
+    data['stock']['warehouse'] = 'Almaty'
+    data['transactions']['warehouse'] = 'Astana'
+    assert pd.isna(first(demand_case).recommended_qty)
+
+
+def test_fully_out_of_stock_month_uses_observed_intensity(case):
+    data, settings = case
+    settings['restore_stockouts'] = True
+    data['monthly_sales'] = pd.concat([data['monthly_sales'], pd.DataFrame([
+        dict(supplier='IEK',sku='001_',month=pd.Timestamp('2026-02-01'),quantity=0,is_complete=True)])], ignore_index=True)
+    data['stockouts'] = stockout_rows(('2026-02-01','2026-02-28'))
+    assert first(case).forecast_qty == pytest.approx(140)
+
+
+def test_no_observed_stockout_days_cannot_create_demand(case):
+    data, settings = case
+    settings['restore_stockouts'] = True
+    data['monthly_sales']['quantity'] = 0.0
+    data['stockouts'] = stockout_rows(('2026-03-01','2026-04-20'))
+    assert pd.isna(first(case).recommended_qty)
+    assert 'Нет дней доступности' in first(case).reason
+
+
+def test_sales_during_full_month_stockout_require_reconciliation(case):
+    case[1]['restore_stockouts'] = True
+    case[0]['stockouts'] = stockout_rows(('2026-03-01','2026-03-31'))
+    assert pd.isna(first(case).recommended_qty)
+
+
+def test_quality_mismatch_is_not_waived_by_algorithm_flags(demand_case):
+    data, settings = demand_case
+    settings.update(restore_stockouts=True, enable_trend=True)
+    data['quality_report'] = pd.DataFrame([dict(supplier='IEK',sku='001_',severity='error',
+        issue='monthly_transaction_mismatch:2026-03',source='cross_source')])
+    row = first(demand_case)
+    assert pd.isna(row.recommended_qty)
+    assert 'monthly_transaction_mismatch:2026-03' in row.reason
+
+
+def test_capabilities_are_explicit():
+    from engine import ENGINE_CAPABILITIES
+    for feature in ['exclude_anomalies','restore_stockouts','trend','strict_snapshot_date']:
+        assert ENGINE_CAPABILITIES[feature] is True
+
+
+def test_known_customer_split_purchase_is_detected_once(demand_case):
+    data, settings = demand_case
+    data['transactions']['customer_id'] = 'regular'
+    baseline = first(demand_case).forecast_qty
+    for i in range(20):
+        add_spike(data, quantity=10, document=f'client-bulk-{i}', customer_id='bulk-client')
+    result = calculate_orders(data, settings)
+    assert len(result['anomalies']) == 20
+    assert result['anomalies'].excluded.all()
+    assert result['anomalies'].quantity.sum() == 200
+    assert result['orders'].iloc[0].forecast_qty == pytest.approx(baseline)
+
+
+def test_unknown_customer_documents_are_not_falsely_clustered(demand_case):
+    data, settings = demand_case
+    baseline = first(demand_case).forecast_qty
+    for i in range(20):
+        add_spike(data, quantity=10, document=f'unknown-{i}')
+    result = calculate_orders(data, settings)
+    assert result['anomalies'].empty
+    assert result['orders'].iloc[0].forecast_qty > baseline
+
+
+def test_document_and_customer_detection_do_not_double_subtract(demand_case):
+    data, settings = demand_case
+    data['transactions']['customer_id'] = 'regular'
+    baseline = first(demand_case).forecast_qty
+    add_spike(data, customer_id='bulk-client')
+    result = calculate_orders(data, settings)
+    assert len(result['anomalies']) == 1
+    assert result['orders'].iloc[0].forecast_qty == pytest.approx(baseline)
+
+
+@pytest.mark.parametrize('months,allowed', [
+    ('2024-01,2025-09',True), ('2026-04',True),
+    ('2025-09,2026-03',False), ('2026-03',False),
+    ('',False), ('2026-13',False), ('unknown',False), ('2024-01,',False)])
+def test_mismatch_applies_only_to_used_months(demand_case, months, allowed):
+    data, settings = demand_case
+    settings.update(enable_trend=True, restore_stockouts=True)
+    issue = 'monthly_transaction_mismatch:' + months
+    data['quality_report'] = pd.DataFrame([dict(supplier='IEK',sku='001_',severity='error',issue=issue,source='cross_source')])
+    original = deepcopy(data)
+    result = calculate_orders(data, settings)
+    assert bool(result['orders'].recommended_qty.notna().iloc[0]) == allowed
+    assert ((result['diagnostics'].issue == issue) & (result['diagnostics'].severity == 'error')).any()
+    if allowed:
+        assert result['diagnostics'].issue.str.contains('неприменима').any()
+        assert result['orders'].iloc[0].data_quality == 'warning'
+    for key in data:
+        pd.testing.assert_frame_equal(data[key], original[key])
+
+
+def test_period_exception_never_covers_unit_errors(demand_case):
+    data, settings = demand_case
+    data['quality_report'] = pd.DataFrame([
+        dict(supplier='IEK',sku='001_',severity='error',issue='monthly_transaction_mismatch:2024-01'),
+        dict(supplier='IEK',sku='001_',severity='error',issue='conflicting_units')])
+    assert pd.isna(first(demand_case).recommended_qty)
+    assert 'conflicting_units' in first(demand_case).reason
+
+
+def test_incomplete_september_is_not_used_even_with_quality_exception(demand_case):
+    data, settings = demand_case
+    data['monthly_sales'] = pd.concat([data['monthly_sales'],pd.DataFrame([
+        dict(supplier='IEK',sku='001_',month=pd.Timestamp('2026-04-01'),quantity=999999,is_complete=False)])],ignore_index=True)
+    baseline = first(demand_case).forecast_qty
+    data['quality_report'] = pd.DataFrame([dict(supplier='IEK',sku='001_',severity='error',issue='monthly_transaction_mismatch:2026-04')])
+    assert first(demand_case).forecast_qty == baseline
