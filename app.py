@@ -13,6 +13,8 @@ from engine import ENGINE_CAPABILITIES
 from demo_data import DEMO_DATE, DEMO_SCENARIOS, make_demo_case
 from export import build_approved_csv
 from order_review import make_review, merge_visible_edits, review_signature, validate_selection
+from quality_review import (BLOCKING, REVIEW, OUTSIDE, INFO, LABELS as ISSUE_LABELS,
+                            build_issue_report, build_issue_csv, summarize_issues, reconciliation_details)
 from ui_integration import input_signature, load_uploads, run_calculation, upload_key, named_supplier, SUPPLIERS
 from ai_assistant import (AIConfig, EXPLAIN, CLARIFY, build_context, collect_sku_issues,
                           read_config, session_explanation, sync_ai_state)
@@ -128,6 +130,11 @@ def calculate(mode, uploads, settings, signature, supplier_choices=None, demo_sc
         data = st.session_state.dataset
     result, prepared = run_calculation(data, settings)
     draft = make_review(result['orders'], data['products'], settings)
+    issue_report = build_issue_report(prepared, result)
+    issue_csv = build_issue_csv(issue_report, calculation_date=settings['as_of'], source_mode=mode)
+    for key in list(st.session_state):
+        if key.startswith('quality_filter_') or key in {'quality_product', 'quality_finding'}:
+            del st.session_state[key]
     comparison = None
     if mode == 'Демонстрация' and demo_scenario != 'overview':
         flag = DEMO_SCENARIOS[demo_scenario]['flag']
@@ -142,6 +149,7 @@ def calculate(mode, uploads, settings, signature, supplier_choices=None, demo_sc
         calculated_mode=mode, calculated_files=[name for name, _ in uploads],
         calculated_supplier_choices=dict(supplier_choices or {}),
         calculated_demo_scenario=demo_scenario, demo_comparison=comparison,
+        issue_report=issue_report, issue_csv=issue_csv,
         calculated_at=datetime.now().strftime('%H:%M:%S'), revision=st.session_state.get('revision', 0) + 1)
     st.session_state.pop('calculation_error', None)
 
@@ -457,11 +465,106 @@ def details_tab(stale, ai_config):
     st.caption('Тренд и коррекции отражаются в прогнозе после пересчёта. Без подтверждённых интервалов stockout восстановление не выполняется. Отсутствие ID клиентов ограничивает проверку повторных покупок.')
 
 
-def data_tab():
+def quality_select(label, options, key, **kwargs):
+    if key in st.session_state and st.session_state[key] not in options:
+        del st.session_state[key]
+    return st.selectbox(label, options, key=key, **kwargs)
+
+
+def issue_review(stale):
+    st.markdown('#### Что мешает расчёту и что проверить')
+    if 'issue_report' not in st.session_state:
+        st.session_state.issue_report = build_issue_report(st.session_state.prepared, st.session_state.result)
+        st.session_state.issue_csv = build_issue_csv(st.session_state.issue_report,
+            calculation_date=st.session_state.calculated_settings['as_of'], source_mode=st.session_state.calculated_mode)
+    report = st.session_state.issue_report
+    orders = st.session_state.result['orders']
+    blocked = orders.loc[orders.data_quality.eq('insufficient'), ['supplier', 'sku']].drop_duplicates()
+    st.write(f'Товаров с недостаточными данными: **{len(blocked)}**. Замечаний после объединения повторов: **{len(report)}**.')
+    st.caption('«Блокирует расчёт» — подтверждённая причина. «Требует проверки» — нужно разобраться, влияет ли замечание на результат. '
+        '«Вне выбранного периода» — расчёт явно исключил эту историческую ошибку; исходная диагностика сохранена.')
+    st.caption('Проверка товара может остановиться на первой причине. Список не доказывает отсутствие других проблем. '
+        'Итоговый допуск определяет расчёт, а этот отчёт не меняет количества и утверждение.')
+    if stale:
+        st.warning('Список относится к предыдущему расчёту. Пересчитайте после изменения данных или параметров; скачивание пока недоступно.')
+    if report.empty:
+        st.info('Замечаний в выполненной проверке нет.')
+        return
+    st.dataframe(summarize_issues(report), hide_index=True, width='stretch')
+    st.caption('Товары считаются по паре поставщик + код 1С. Один товар может входить в несколько строк сводки; количества строк не суммируются. '
+        'Замечания без связи со справочником сохраняются, но не увеличивают число товаров.')
+    prefix = 'DEMO_' if st.session_state.calculated_mode == 'Демонстрация' else ''
+    st.download_button('Скачать полный список проблем (CSV)', data=st.session_state.issue_csv,
+        file_name=f'{prefix}StockPilot_problems_{st.session_state.calculated_settings["as_of"]}.csv',
+        mime='text/csv', key='download_issues', disabled=stale, on_click='ignore')
+    st.caption('CSV содержит все замечания выполненного расчёта, включая исторические и информационные, независимо от фильтров ниже. '
+        'В нём сохранены исходный текст, уровень, источник, период и основание применимости. Это список для проверки, не заказ поставщику.')
+
+    left, middle, right = st.columns(3)
+    with left:
+        supplier = quality_select('Поставщик замечаний', ['Все поставщики'] + sorted(report.supplier.dropna().unique()), 'quality_filter_supplier')
+    with middle:
+        category = quality_select('Тип проблемы', ['Все типы'] + sorted(report.category.unique()), 'quality_filter_category')
+    with right:
+        status = quality_select('Применимость замечания', ['Требуют действий', 'Все замечания', BLOCKING, REVIEW, OUTSIDE, INFO], 'quality_filter_status')
+    search = st.text_input('Найти код или название товара', key='quality_filter_search')
+    filtered = report
+    if supplier != 'Все поставщики':
+        filtered = filtered.loc[filtered.supplier.eq(supplier)]
+    if category != 'Все типы':
+        filtered = filtered.loc[filtered.category.eq(category)]
+    if status == 'Требуют действий':
+        filtered = filtered.loc[filtered.applicability.isin([BLOCKING, REVIEW])]
+    elif status != 'Все замечания':
+        filtered = filtered.loc[filtered.applicability.eq(status)]
+    if search:
+        filtered = filtered.loc[filtered.sku.fillna('').str.contains(search, case=False, regex=False)
+            | filtered.name.fillna('').str.contains(search, case=False, regex=False)]
+    visible_columns = ['supplier', 'sku', 'name', 'category', 'applicability', 'months', 'source', 'action']
+    st.caption(f'Найдено замечаний: {len(filtered)}. В таблице показаны первые 300; полный список доступен в CSV.')
+    st.dataframe(filtered[visible_columns].head(300).rename(columns=ISSUE_LABELS), hide_index=True, width='stretch')
+    if filtered.empty:
+        st.info('По выбранным фильтрам замечаний нет.')
+        return
+
+    products = filtered[['supplier', 'sku', 'name']].drop_duplicates(['supplier', 'sku'])
+    choices = [tuple(None if pd.isna(value) else value for value in row)
+               for row in products.itertuples(index=False, name=None)]
+    choice = quality_select('Товар для разбора', choices, 'quality_product',
+        format_func=lambda item: f'{item[0] or "Не указан"} / {item[1] or "Не указан"} — {item[2] or "Без наименования"}')
+    selected = filtered.loc[(filtered.supplier.isna() if choice[0] is None else filtered.supplier.eq(choice[0]))
+        & (filtered.sku.isna() if choice[1] is None else filtered.sku.eq(choice[1]))]
+    index = quality_select('Замечание товара', selected.index.tolist(), 'quality_finding',
+        format_func=lambda i: f'{report.loc[i, "applicability"]} · {report.loc[i, "summary"]}')
+    finding = report.loc[index]
+    st.markdown('##### Разбор замечания')
+    st.write(finding['summary'])
+    severity = {'error': 'Ошибка', 'warning': 'Предупреждение', 'info': 'Информация'}.get(finding.severity, finding.severity)
+    st.write('Применимость: ' + finding.applicability + ' · исходный уровень: ' + severity)
+    source = 'Не указан' if pd.isna(finding.source) else str(finding.source)
+    period = 'В сообщении не указан' if pd.isna(finding.months) else str(finding.months)
+    st.write('Источник: ' + source + ' · период: ' + period)
+    st.write('Что исправить или уточнить: ' + finding.action)
+    st.caption('Основание: ' + finding.evidence)
+    st.caption('Итог расчёта товара: ' + QUALITY.get(finding.order_status, finding.order_status))
+    with st.expander('Исходное сообщение выбранного замечания'):
+        st.text(finding.issue)
+    evidence = reconciliation_details(st.session_state.dataset.get('monthly_sales', pd.DataFrame()), finding)
+    if not evidence.empty:
+        st.markdown('##### Сверка указанных месяцев')
+        st.dataframe(evidence.rename(columns={'month': 'Месяц', 'quantity': 'Месячный отчёт',
+            'reconciled_transaction_quantity': 'Сумма операций', 'reconciliation_difference': 'Разница: отчёт − операции',
+            'reconciliation_status': 'Результат сверки', 'is_complete': 'Месяц завершён'}), hide_index=True, width='stretch')
+        st.caption('Значения взяты из сверки источников. Пропуск означает неизвестное количество; совпадение чисел не подтверждает единицы и складской охват.')
+
+
+def data_tab(stale):
     st.subheader('Источники и качество данных')
     dataset = st.session_state.dataset
     files = st.session_state.get('calculated_files', [])
-    st.caption('Источники: ' + (', '.join(files) if files else 'синтетический набор StockPilot, 8 товаров'))
+    st.caption('Источники: ' + (', '.join(files) if files else f'синтетический набор StockPilot, товаров: {len(dataset["products"])}'))
+    issue_review(stale)
+    st.markdown('#### Исходные таблицы и полная диагностика')
     counts = pd.DataFrame({'Таблица': list(dataset), 'Строк': [len(frame) for frame in dataset.values()]})
     a, b = st.columns([2, 3], gap='large')
     a.dataframe(counts, hide_index=True, width='stretch')
@@ -475,7 +578,7 @@ def data_tab():
     diag = st.session_state.result['diagnostics']
     report = pd.concat([q.assign(stage='Источник'), diag.assign(stage='Расчёт')], ignore_index=True)
     if report.empty:
-        st.success('Замечаний к данным нет.')
+        st.info('Исходных диагностических сообщений нет.')
     else:
         level = st.selectbox('Уровень сообщения', ['Все', 'Ошибки', 'Предупреждения', 'Информация'], key='diagnostic_level')
         mapping = {'Ошибки': 'error', 'Предупреждения': 'warning', 'Информация': 'info'}
@@ -556,7 +659,7 @@ def main():
         with tabs[1]:
             details_tab(stale, ai_config)
     with tabs[2]:
-        data_tab()
+        data_tab(stale)
     st.markdown('<div class="foot">StockPilot · HackAlem AI &nbsp; / &nbsp; Нурасыл — данные · Гапар — расчёты · Рамазан — интерфейс</div>', unsafe_allow_html=True)
 
 
