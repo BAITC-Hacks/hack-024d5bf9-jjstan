@@ -33,6 +33,13 @@ def _rows(dataset, table, supplier, sku=None):
     return frame.loc[mask].copy()
 
 
+def _scope(value):
+    """Accept the legacy loader spelling without guessing an unknown scope."""
+    if pd.isna(value):
+        return None
+    return '__all__' if value in ('__all__', '*all*') else value
+
+
 def _number(value, label, positive=False, integer=False):
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f'{label}: требуется число, не bool')
@@ -112,6 +119,9 @@ def calculate_orders(dataset: dict, settings: dict) -> dict:
             end = as_of + pd.Timedelta(days=horizon)
             dates = pd.date_range(as_of + pd.Timedelta(days=1), end, freq='D')
             quality = dataset.get('quality_report', pd.DataFrame())
+            confirmed_scope = _scope(settings.get('confirmed_warehouse_scope', {}).get(supplier))
+            if confirmed_scope is not None and (not isinstance(confirmed_scope, str) or not confirmed_scope.strip()):
+                raise ValueError('confirmed_warehouse_scope: нужен непустой склад или __all__')
             if not quality.empty:
                 quality = quality.loc[
                     (quality['supplier'].isna() | quality['supplier'].eq(supplier))
@@ -123,6 +133,8 @@ def calculate_orders(dataset: dict, settings: dict) -> dict:
                     note(supplier, sku, severity, str(finding.get('issue', 'Ошибка качества данных')))
                 if quality['severity'].eq('error').any():
                     raise ValueError('Загрузчик сообщил об ошибках данных для SKU')
+                if quality['issue'].eq('warehouse_scope_unconfirmed').any() and confirmed_scope is None:
+                    raise ValueError('Подтвердите единый контур продаж, остатков и транзита: confirmed_warehouse_scope')
 
             history = _rows(dataset, 'monthly_sales', supplier, sku)
             required = {'month', 'quantity', 'is_complete'}
@@ -153,7 +165,7 @@ def calculate_orders(dataset: dict, settings: dict) -> dict:
             factors = {month: 1.0 for month in range(1, 13)}
             if not season.empty:
                 specific = season.loc[season['category'].eq(product.get('category'))]
-                season = specific if not specific.empty else season.loc[season['category'].eq('__all__')]
+                season = specific if not specific.empty else season.loc[season['category'].isin(['__all__', '*all*'])]
                 if season['month_number'].duplicated().any():
                     raise ValueError('Дубли месяцев в сезонном профиле')
                 for _, factor in season.iterrows():
@@ -180,7 +192,15 @@ def calculate_orders(dataset: dict, settings: dict) -> dict:
             if stock.empty:
                 raise ValueError('Нет текущего свободного остатка')
             stock['as_of'] = pd.to_datetime(stock['as_of'], errors='coerce')
-            stock = stock.loc[stock['as_of'].le(as_of)]
+            stock = stock.loc[stock['as_of'].le(as_of) & stock['is_current'].eq(True)]
+            if stock.empty:
+                raise ValueError('Остаток исторический или отсутствует: нужен актуальный снимок')
+            stock['warehouse'] = stock['warehouse'].map(_scope)
+            if confirmed_scope is not None:
+                stock['warehouse'] = stock['warehouse'].fillna(confirmed_scope)
+                if not stock['warehouse'].eq(confirmed_scope).all():
+                    raise ValueError('Подтверждённый контур не совпадает с текущим остатком')
+                note(supplier, sku, 'warning', f'Контур продаж, остатков и транзита подтверждён настройкой: {confirmed_scope}')
             if stock.empty or stock['warehouse'].isna().any() or stock['warehouse'].nunique() != 1:
                 raise ValueError('Не определён единый контур склада для остатка')
             latest = stock.loc[stock['as_of'].eq(stock['as_of'].max())]
@@ -201,6 +221,9 @@ def calculate_orders(dataset: dict, settings: dict) -> dict:
                 if not np.isfinite(incoming['quantity']).all() or incoming['quantity'].lt(0).any():
                     raise ValueError('Некорректное количество транзита')
                 incoming = incoming.loc[incoming['quantity'].gt(0)]
+                incoming['warehouse'] = incoming['warehouse'].map(_scope)
+                if confirmed_scope is not None:
+                    incoming['warehouse'] = incoming['warehouse'].fillna(confirmed_scope)
                 incoming['expected_date'] = pd.to_datetime(incoming['expected_date'], errors='coerce').dt.normalize()
                 if incoming['expected_date'].isna().any():
                     raise ValueError('Неизвестна дата поступления')
@@ -213,7 +236,15 @@ def calculate_orders(dataset: dict, settings: dict) -> dict:
                 receipts = arrivals.reindex(dates, fill_value=0.0)
             total_incoming = float(receipts.sum() + today_receipts)
             raw = max(0.0, forecast_qty + safety - free - total_incoming)
-            recommended = round_order(raw, product.get('min_order_qty'), product.get('pack_multiple'))
+            constraints = {}
+            for field in ['min_order_qty', 'pack_multiple']:
+                value = product.get(field)
+                supplied = settings.get('order_constraints_by_supplier', {}).get(supplier, {})
+                if raw > 0 and pd.isna(value) and field in supplied:
+                    value = supplied[field]
+                    note(supplier, sku, 'warning', f'{field} отсутствует в файле; применена явная настройка {value}')
+                constraints[field] = value
+            recommended = round_order(raw, **constraints)
             balance = free + today_receipts + receipts.cumsum() - predicted.cumsum()
             shortage = balance[balance < -1e-9]
             if not shortage.empty:

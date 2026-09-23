@@ -146,3 +146,90 @@ def test_transit_with_different_scope_blocks(case):
 def test_overdue_transit_requires_reconciliation(case):
     case[0]['transit'].loc[0, 'expected_date'] = pd.Timestamp('2026-03-31')
     assert pd.isna(first(case)['recommended_qty'])
+
+
+def test_loader_seasonality_alias(case):
+    case[0]['seasonality']['category'] = '*all*'
+    case[0]['seasonality'].loc[case[0]['seasonality'].month_number.eq(4), 'factor'] = 2
+    assert first(case)['forecast_qty'] == 280
+
+
+def test_historical_unknown_scope_does_not_poison_current_snapshot(case):
+    history = dict(supplier='IEK', sku='001_', warehouse=None,
+        as_of=pd.Timestamp('2026-03-01'), free_stock=float('nan'), is_current=False)
+    case[0]['stock'] = pd.concat([case[0]['stock'], pd.DataFrame([history])], ignore_index=True)
+    assert first(case)['recommended_qty'] == 72
+
+
+def test_explicit_scope_fills_unknown_transit_without_mutation(case):
+    case[0]['stock']['warehouse'] = '*all*'
+    case[0]['transit']['warehouse'] = None
+    case[1]['confirmed_warehouse_scope'] = {'IEK': '__all__'}
+    assert first(case)['recommended_qty'] == 72
+    assert case[0]['transit']['warehouse'].isna().all()
+
+
+def test_explicit_scope_does_not_override_known_conflicting_scope(case):
+    case[1]['confirmed_warehouse_scope'] = {'IEK': '__all__'}
+    case[0]['transit']['warehouse'] = 'Other'
+    assert pd.isna(first(case)['recommended_qty'])
+
+
+def test_loader_unconfirmed_scope_requires_setting(case):
+    case[0]['quality_report'] = pd.DataFrame([dict(supplier='IEK', sku=None,
+        severity='warning', issue='warehouse_scope_unconfirmed', source='test')])
+    assert pd.isna(first(case)['recommended_qty'])
+    case[1]['confirmed_warehouse_scope'] = {'IEK': '__all__'}
+    assert first(case)['recommended_qty'] == 72
+
+
+def test_explicit_missing_constraint_default_with_diagnostics(case):
+    case[0]['products']['pack_multiple'] = float('nan')
+    case[1]['order_constraints_by_supplier'] = {'IEK': {'min_order_qty': 999, 'pack_multiple': 12}}
+    result = calculate_orders(*case)
+    assert result['orders'].iloc[0]['recommended_qty'] == 72  # existing minimum 24 wins
+    assert result['diagnostics'].issue.str.contains('pack_multiple отсутствует').any()
+    assert pd.isna(case[0]['products'].iloc[0].pack_multiple)
+
+
+def test_loader_workbooks_to_engine(tmp_path):
+    """Runs when feat/data is integrated; actual adapter, no mocked tables."""
+    loader = pytest.importorskip('data_loader')
+    from openpyxl import Workbook
+    def book(name, rows):
+        path = tmp_path / name
+        wb = Workbook()
+        for row in rows:
+            wb.active.append(row)
+        wb.save(path)
+        wb.close()
+        return str(path)
+    paths = [
+        book('Ежемесячные продажи Systeme.xlsx', [
+            ['Номенклатура', 'Номенклатура.Код', 'март 2026', 'апр. 2026'],
+            [None, None, 'Количество', 'Количество'], ['Test', '001_', 310, None]]),
+        book('Динамика Systeme.xlsx', [
+            ['Дата', 'Номер', 'Документ', 'Код', 'Номенклатура', 'Ед.', 'Склад', 'Количество'],
+            ['10.03.2026', '1', 'Расходная накладная 1', '001_', 'Test', 'шт', 'Алматы', 310]]),
+        book('Товар в пути Systeme на 01.04.2026.xlsx', [
+            ['Код 1с', 'Наименование', 'Категория 2026', 'Свободный остаток', 'СЭ в пути 02.04'],
+            ['001_', 'Test', 'A', 50, 40]]),
+        book('MOQ Systeme.xlsx', [['Номенклатура.Код', 'Номенклатура', 'Кратность'], ['001_', 'Test', 12]]),
+        book('Ежемесячные остатки Systeme.xlsx', [
+            ['Номенклатура', 'Ед.', 'Номенклатура.Код', 'март 2026'],
+            [None, None, None, 'Количество'], [None, None, None, 'нач. остаток'], ['Test', 'шт', '001_', 100]])]
+    data = loader.load_data(paths)
+    original = deepcopy(data)
+    settings = dict(as_of='2026-04-01', lead_time_days={'Systeme Electric': 7},
+        review_period_days=7, default_safety_days=2, safety_days_by_category={},
+        exclude_anomalies=False, restore_stockouts=False)
+    assert pd.isna(calculate_orders(data, settings)['orders'].iloc[0].recommended_qty)
+    settings['confirmed_warehouse_scope'] = {'Systeme Electric': '__all__'}
+    settings['order_constraints_by_supplier'] = {'Systeme Electric': {'min_order_qty': 0}}
+    result = calculate_orders(data, settings)
+    row = result['orders'].iloc[0]
+    assert row.forecast_qty == pytest.approx(140), row.reason
+    assert row.incoming_in_horizon == 40, row.reason
+    assert row.recommended_qty == 72, row.reason
+    for key in data:
+        pd.testing.assert_frame_equal(data[key], original[key])
